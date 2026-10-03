@@ -2,49 +2,165 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from urllib.parse import urlparse
 import re
+import joblib
+import pandas as pd
 
-app = FastAPI(title="Phishing URL Detection API")
+app = FastAPI(
+    title="PHISHGUARD - Intelligent Phishing URL Detection",
+    version="1.0.0"
+)
+
+# Load trained XGBoost model
+model_data = joblib.load("ml/phishguard_model.joblib")
+model = model_data["model"]
+FEATURES = model_data["features"]
 
 
 class URLRequest(BaseModel):
     url: str
 
 
-def analyze_url(url: str):
-    score = 0
-    reasons = []
+def extract_features(url):
+    url = url.strip()
+
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
+        url = "https://" + url
 
     parsed = urlparse(url)
     hostname = parsed.hostname or ""
 
-    # 1. HTTPS check
-    if parsed.scheme != "https":
+    features = {}
+
+    features["URLLength"] = len(url)
+    features["DomainLength"] = len(hostname)
+
+    features["IsDomainIP"] = int(
+        bool(re.match(r"^(?:\d{1,3}\.){3}\d{1,3}$", hostname))
+    )
+
+    features["URLSimilarityIndex"] = 0
+    features["CharContinuationRate"] = 0
+    features["TLDLegitimateProb"] = 0.5
+    features["URLCharProb"] = 0.5
+    features["TLDLength"] = len(hostname.split(".")[-1])
+
+    features["NoOfSubDomain"] = max(0, hostname.count(".") - 1)
+
+    features["HasObfuscation"] = int("@" in url or "%" in url)
+
+    features["NoOfObfuscatedChar"] = sum(
+        1 for c in url if c in ["@", "%"]
+    )
+
+    features["ObfuscationRatio"] = (
+        features["NoOfObfuscatedChar"] / max(len(url), 1)
+    )
+
+    features["NoOfLettersInURL"] = sum(c.isalpha() for c in url)
+
+    features["LetterRatioInURL"] = (
+        features["NoOfLettersInURL"] / max(len(url), 1)
+    )
+
+    features["NoOfDegitsInURL"] = sum(c.isdigit() for c in url)
+
+    features["DegitRatioInURL"] = (
+        features["NoOfDegitsInURL"] / max(len(url), 1)
+    )
+
+    features["NoOfEqualsInURL"] = url.count("=")
+    features["NoOfQMarkInURL"] = url.count("?")
+    features["NoOfAmpersandInURL"] = url.count("&")
+
+    special_chars = sum(
+        not c.isalnum() and c not in "/.:_-"
+        for c in url
+    )
+
+    features["NoOfOtherSpecialCharsInURL"] = special_chars
+
+    features["SpacialCharRatioInURL"] = (
+        special_chars / max(len(url), 1)
+    )
+
+    features["IsHTTPS"] = int(
+        parsed.scheme.lower() == "https"
+    )
+
+    # Features that require webpage access
+    # are set to safe defaults for this demo.
+    defaults = {
+        "LineOfCode": 0,
+        "LargestLineLength": 0,
+        "HasTitle": 0,
+        "DomainTitleMatchScore": 0,
+        "URLTitleMatchScore": 0,
+        "HasFavicon": 0,
+        "Robots": 0,
+        "IsResponsive": 0,
+        "NoOfURLRedirect": 0,
+        "NoOfSelfRedirect": 0,
+        "HasDescription": 0,
+        "NoOfPopup": 0,
+        "NoOfiFrame": 0,
+        "HasExternalFormSubmit": 0,
+        "HasSocialNet": 0,
+        "HasSubmitButton": 0,
+        "HasHiddenFields": 0,
+        "HasPasswordField": 0,
+        "Bank": 0,
+        "Pay": 0,
+        "Crypto": 0,
+        "HasCopyrightInfo": 0,
+        "NoOfImage": 0,
+        "NoOfCSS": 0,
+        "NoOfJS": 0,
+        "NoOfSelfRef": 0,
+        "NoOfEmptyRef": 0,
+        "NoOfExternalRef": 0,
+    }
+
+    features.update(defaults)
+
+    return pd.DataFrame(
+        [[features.get(feature, 0) for feature in FEATURES]],
+        columns=FEATURES
+    )
+
+
+def analyze_rules(url):
+    score = 0
+    reasons = []
+
+    test_url = url if "://" in url else "https://" + url
+
+    parsed = urlparse(test_url)
+    hostname = parsed.hostname or ""
+    lower_url = url.lower()
+
+    if parsed.scheme.lower() != "https":
         score += 20
         reasons.append("URL does not use HTTPS")
 
-    # 2. IP address check
-    ip_pattern = r"^(?:\d{1,3}\.){3}\d{1,3}$"
-
-    if re.match(ip_pattern, hostname):
+    if re.match(
+        r"^(?:\d{1,3}\.){3}\d{1,3}$",
+        hostname
+    ):
         score += 30
-        reasons.append("URL uses an IP address instead of a domain")
+        reasons.append("URL uses an IP address")
 
-    # 3. @ symbol check
     if "@" in url:
-        score += 25
+        score += 20
         reasons.append("URL contains @ symbol")
 
-    # 4. Long URL check
     if len(url) > 100:
-        score += 15
+        score += 10
         reasons.append("URL is unusually long")
 
-    # 5. Too many subdomains
     if hostname.count(".") >= 3:
-        score += 15
-        reasons.append("URL contains many subdomains")
+        score += 10
+        reasons.append("Many subdomains detected")
 
-    # 6. Suspicious keywords
     suspicious_words = [
         "login",
         "verify",
@@ -54,53 +170,88 @@ def analyze_url(url: str):
         "update",
         "password",
         "bank",
-        "signin"
+        "signin",
+        "confirm",
+        "wallet",
+        "payment"
     ]
 
-    found_words = []
+    found = [
+        word for word in suspicious_words
+        if word in lower_url
+    ]
 
-    for word in suspicious_words:
-        if word in url.lower():
-            found_words.append(word)
-
-    if found_words:
+    if found:
         score += 10
         reasons.append(
-            "Suspicious keywords found: "
-            + ", ".join(found_words)
+            "Suspicious keywords: " + ", ".join(found)
         )
 
-    # Maximum score = 100
-    score = min(score, 100)
+    if "xn--" in hostname.lower():
+        score += 20
+        reasons.append("Punycode domain detected")
 
-    if score >= 40:
-        prediction = "Phishing"
-        confidence = score
-    else:
-        prediction = "Likely Safe"
-        confidence = 100 - score
-
-    return prediction, confidence, score, reasons
+    return min(score, 100), reasons
 
 
 @app.get("/")
 def home():
     return {
-        "message": "Phishing Detection API is running!"
+        "status": "online",
+        "message": "PHISHGUARD API is running!"
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy",
+        "model": "XGBoost"
     }
 
 
 @app.post("/predict")
 def predict_url(request: URLRequest):
 
-    prediction, confidence, risk_score, reasons = analyze_url(
-        request.url
+    url = request.url.strip()
+
+    features = extract_features(url)
+
+    probability = model.predict_proba(features)[0][1]
+
+    ml_score = round(float(probability) * 100, 2)
+
+    rule_score, reasons = analyze_rules(url)
+
+    risk_score = round(
+        (ml_score * 0.7) + (rule_score * 0.3),
+        2
     )
 
+    if risk_score >= 70:
+        prediction = "Phishing"
+    elif risk_score >= 40:
+        prediction = "Suspicious"
+    else:
+        prediction = "Likely Safe"
+
+    confidence = round(
+        risk_score if prediction != "Likely Safe"
+        else 100 - risk_score,
+        2
+    )
+
+    if not reasons:
+        reasons.append(
+            "No major suspicious URL patterns detected"
+        )
+
     return {
-        "url": request.url,
+        "url": url,
         "prediction": prediction,
         "confidence": confidence,
         "risk_score": risk_score,
+        "ml_score": ml_score,
+        "rule_score": rule_score,
         "reasons": reasons
     }
